@@ -1,3 +1,2 @@
 slack_bolt
 flask
-supabase
