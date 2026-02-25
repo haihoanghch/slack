@@ -1,29 +1,28 @@
 import os
-from flask import Flask, request, jsonify
+from flask import Flask, request
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 
-# Khởi tạo Flask trước
-app = Flask(__name__)
-
-# Lấy biến môi trường (Có giá trị mặc định để tránh crash)
-token = os.environ.get("SLACK_BOT_TOKEN", "dummy-token")
-secret = os.environ.get("SLACK_SIGNING_SECRET", "dummy-secret")
-
-# Khởi tạo Bolt
-bolt_app = App(token=token, signing_secret=secret, process_before_response=True)
+# 1. Khởi tạo Slack Bolt (Dùng biến dummy để tránh crash nếu thiếu env)
+bolt_app = App(
+    token=os.environ.get("SLACK_BOT_TOKEN", "xoxb-dummy"),
+    signing_secret=os.environ.get("SLACK_SIGNING_SECRET", "dummy"),
+    process_before_response=True
+)
 handler = SlackRequestHandler(bolt_app)
+
+# 2. Khởi tạo Flask và ĐẶT TÊN LÀ app
+app = Flask(__name__)
 
 @bolt_app.command("/crm")
 @bolt_app.command("/ticket")
 def handle_test(ack, say):
     ack()
-    say("Hệ thống đã nhận lệnh! Server đang sống khỏe mạnh. ✅")
+    say("✅ Kết nối thành công! Serverless Function đang hoạt động.")
 
-@app.route("/", methods=["POST"])
-def slack_events():
+@app.route("/", defaults={"path": ""}, methods=["POST", "GET"])
+@app.route("/<path:path>", methods=["POST", "GET"])
+def index(path):
+    if request.method == "GET":
+        return "Server is Live!", 200
     return handler.handle(request)
-
-@app.route("/", methods=["GET"])
-def health():
-    return "OK - Server is Live", 200
