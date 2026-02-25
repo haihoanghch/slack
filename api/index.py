@@ -1,89 +1,78 @@
 import os
+import logging
+from flask import Flask, request
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
-from flask import Flask, request
+from supabase import create_client
 
-# Cấu hình Slack App (Sử dụng Lazy Listeners cho Serverless nếu xử lý nặng)
-app = App(
+# 1. Khởi tạo Flask TRƯỚC và đặt tên là 'app'
+app = Flask(__name__)
+
+# 2. Khởi tạo Slack Bolt App 
+bolt_app = App(
     token=os.environ.get("SLACK_BOT_TOKEN"),
     signing_secret=os.environ.get("SLACK_SIGNING_SECRET"),
-    process_before_response=True # Quan trọng cho Serverless
+    process_before_response=True
 )
+handler = SlackRequestHandler(bolt_app)
 
-# 1. Xử lý Slash Command: Gửi nút xác nhận
-@app.command("/manage")
-def handle_command(ack, body, say):
-    ack() # Phải phản hồi trong < 3s
-    
-    user_id = body["user_id"]
-    content = body["text"]
-    
-    # Giao diện nút bấm (Block Kit)
-    blocks = [
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"📋 *Yêu cầu mới:* {content}\nNgười tạo: <@{user_id}>"}
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Xác nhận ✅"},
-                    "action_id": "approve_btn",
-                    "value": f"{user_id}|{content}", # Lưu context
-                    "style": "primary"
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Hủy ❌"},
-                    "action_id": "deny_btn",
-                    "style": "danger"
-                }
-            ]
-        }
-    ]
-    say(blocks=blocks)
+# 3. Kết nối Supabase
+try:
+    supabase = create_client(
+        os.environ.get("SUPABASE_URL"), 
+        os.environ.get("SUPABASE_KEY")
+    )
+except Exception as e:
+    print(f"Supabase Init Error: {e}")
 
-# 2. Xử lý logic khi nhấn nút
-@app.action("approve_btn")
-def handle_approve(ack, body, client, say):
+# --- LOGIC SLACK (Giữ nguyên) ---
+
+@bolt_app.command("/crm")
+@bolt_app.command("/ticket")
+def handle_universal_commands(ack, body, say):
     ack()
+    user_id = body["user_id"]
+    command = body["command"]
+    content = body.get("text", "").strip()
     
-    current_user = body["user"]["id"]
-    val = body["actions"][0]["value"].split("|")
-    creator_id = val[0]
-    task_content = val[1]
+    # Ghi log (pending)
+    try:
+        supabase.table("logs").insert({"user_id": user_id, "command": command, "content": content, "status": "pending"}).execute()
+    except: pass
 
-    # Kiểm tra quyền: Chỉ người tạo mới được bấm (hoặc logic @mention)
-    if current_user != creator_id:
-        client.chat_postEphemeral(
-            channel=body["channel"]["id"],
-            user=current_user,
-            text="⚠️ Bạn không đủ quyền để thực hiện thao tác này."
-        )
-        return
-
-    # THỰC HIỆN CÁC HÀM TƯƠNG ỨNG (Log, Email, Odoo)
-    log_to_supabase(current_user, "APPROVED", task_content)
-    # create_odoo_record(task_content)
-    
-    # Cập nhật tin nhắn để tránh bấm lại
-    client.chat_update(
-        channel=body["channel"]["id"],
-        ts=body["message"]["ts"],
-        text=f"✅ Đã xử lý bởi <@{current_user}>",
-        blocks=[]
+    say(
+        blocks=[
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"📍 *Yêu cầu {command}:* {content}"}},
+            {"type": "actions", "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "Xác nhận ✅"}, "style": "primary", "action_id": "approve_btn", "value": f"{user_id}|{command}|{content}"},
+                {"type": "button", "text": {"type": "plain_text", "text": "Hủy ❌"}, "style": "danger", "action_id": "deny_btn", "value": f"{user_id}|{command}|{content}"}
+            ]}
+        ]
     )
 
-def log_to_supabase(user, action, detail):
-    # Sử dụng thư viện supabase-py để ghi log vào DB miễn phí
-    print(f"Logging: {user} did {action} on {detail}")
+@bolt_app.action("approve_btn")
+def handle_approve(ack, body, client):
+    ack()
+    val = body["actions"][0]["value"].split("|")
+    if body["user"]["id"] != val[0]:
+        client.chat_postEphemeral(channel=body["channel"]["id"], user=body["user"]["id"], text="❌ Không có quyền!")
+        return
+    
+    # Cập nhật log & UI
+    try:
+        supabase.table("logs").update({"status": "approved"}).match({"user_id": val[0], "content": val[2]}).execute()
+    except: pass
 
-# Adapter để chạy trên Vercel (Flask)
-flask_app = Flask(__name__)
-handler = SlackRequestHandler(app)
+    client.chat_update(channel=body["channel"]["id"], ts=body["message"]["ts"], text=f"✅ Đã duyệt {val[1]}: {val[2]}", blocks=[])
 
-@flask_app.route("/api/index", methods=["POST"])
-def slack_handler():
+@bolt_app.action("deny_btn")
+def handle_deny(ack, body, client):
+    ack()
+    val = body["actions"][0]["value"].split("|")
+    client.chat_update(channel=body["channel"]["id"], ts=body["message"]["ts"], text=f"🔴 Đã hủy: {val[2]}", blocks=[])
+
+# 4. ROUTE quan trọng nhất cho Vercel
+@app.route("/", defaults={"path": ""}, methods=["POST", "GET"])
+@app.route("/<path:path>", methods=["POST", "GET"])
+def slack_handler(path):
     return handler.handle(request)
